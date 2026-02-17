@@ -47,8 +47,9 @@ Digital control and verification systems
 Educational demonstration of FSM concepts
 
 # 📁 Project Structure
-/src        → Source code  
-/docs       → FSM diagrams & explanation  
+src        → Source code  
+hardware      → image of zedboard
+output_sample_from_EDA     → image of output
 README.md   → Project documentation  
 
 # ✅ Conclusion
