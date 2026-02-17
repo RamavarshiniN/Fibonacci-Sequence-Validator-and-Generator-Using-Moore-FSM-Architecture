@@ -1,0 +1,215 @@
+# design code 
+`timescale 1ns/1ps
+
+module fibonacci_core(
+    input wire clk,
+    input wire reset,
+    input wire start,         
+    input wire input_valid,   
+    input wire seq_done_in,   
+    input wire [7:0] data_in, 
+    output reg [7:0] fib_out,
+    output reg error,
+    output reg done,
+    output [2:0] state_debug 
+);
+
+    localparam [2:0] 
+        IDLE=3'd0, LOAD_A=3'd1, LOAD_B=3'd2, VERIFY=3'd3, 
+        GENERATE=3'd5, DONE_STATE=3'd6, ERROR_STATE=3'd7;
+
+    reg [2:0] current_state, next_state;
+    reg [7:0] reg_A, reg_B, reg_count;
+    reg [7:0] reg_limit; 
+    
+    wire [7:0] sum;
+    wire carry;
+    wire is_equal;
+
+    assign {carry, sum} = reg_A + reg_B;
+    assign is_equal = (data_in == sum);
+    assign state_debug = current_state;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            current_state <= IDLE;
+            reg_A <= 0; reg_B <= 0; reg_count <= 0; reg_limit <= 4; 
+            fib_out <= 0; done <= 0; error <= 0;
+        end else begin
+            current_state <= next_state;
+            case (current_state)
+                IDLE: begin reg_count <= 0; done <= 0; error <= 0; end
+                LOAD_A: if(input_valid) reg_A <= data_in;
+                LOAD_B: if(input_valid) reg_B <= data_in;
+                VERIFY: if(input_valid && !carry && is_equal) begin
+                    reg_A <= reg_B; reg_B <= sum; fib_out <= sum;
+                end
+                GENERATE: if(!carry && reg_count < reg_limit) begin
+                    reg_A <= reg_B; reg_B <= sum; fib_out <= sum;
+                    reg_count <= reg_count + 1;
+                end
+                DONE_STATE: done <= 1;
+                ERROR_STATE: error <= 1;
+            endcase
+        end
+    end
+
+    always @(*) begin
+        next_state = current_state;
+        case (current_state)
+            IDLE: if (start) next_state = LOAD_A;
+            LOAD_A: if (input_valid) next_state = LOAD_B;
+            LOAD_B: if (input_valid) next_state = VERIFY;
+            VERIFY: if (input_valid) begin
+                if (carry || !is_equal) next_state = ERROR_STATE;
+                else if (seq_done_in)   next_state = GENERATE;
+                else                    next_state = VERIFY;
+            end
+            GENERATE: begin
+                if (carry) next_state = ERROR_STATE;
+                else if (reg_count == reg_limit) next_state = DONE_STATE;
+                else next_state = GENERATE;
+            end
+            DONE_STATE: next_state = IDLE;
+            ERROR_STATE: next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+endmodule
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#uart 
+module uart_bus #(parameter CLK_FREQ = 100_000_000, parameter BAUD_RATE = 9600) (
+    input clk, rx,
+    output tx,
+    output reg [7:0] rx_data,
+    output reg rx_ready,
+    input [7:0] tx_data,
+    input tx_start,
+    output tx_busy
+);
+    localparam BIT_PERIOD = CLK_FREQ / BAUD_RATE;
+    reg [3:0] tx_state = 0; reg [15:0] tx_clk_cnt = 0; reg [2:0] tx_bit_idx = 0; reg [7:0] tx_reg;
+    assign tx_busy = (tx_state != 0);
+    assign tx = (tx_state == 1) ? 0 : (tx_state == 2) ? tx_reg[tx_bit_idx] : 1;
+
+    always @(posedge clk) begin
+        case(tx_state)
+            0: if(tx_start) begin tx_reg <= tx_data; tx_state <= 1; tx_clk_cnt <= 0; end
+            1: if(tx_clk_cnt < BIT_PERIOD) tx_clk_cnt <= tx_clk_cnt + 1; else begin tx_clk_cnt <= 0; tx_state <= 2; tx_bit_idx <= 0; end
+            2: if(tx_clk_cnt < BIT_PERIOD) tx_clk_cnt <= tx_clk_cnt + 1; else begin tx_clk_cnt <= 0; if(tx_bit_idx < 7) tx_bit_idx <= tx_bit_idx + 1; else tx_state <= 3; end
+            3: if(tx_clk_cnt < BIT_PERIOD) tx_clk_cnt <= tx_clk_cnt + 1; else begin tx_clk_cnt <= 0; tx_state <= 0; end
+        endcase
+    end
+
+    reg [1:0] rx_state = 0; reg [15:0] rx_clk_cnt = 0; reg [2:0] rx_bit_idx = 0;
+    always @(posedge clk) begin
+        rx_ready <= 0;
+        case(rx_state)
+            0: if(!rx) begin rx_state <= 1; rx_clk_cnt <= 0; end
+            1: if(rx_clk_cnt < BIT_PERIOD + (BIT_PERIOD/2)) rx_clk_cnt <= rx_clk_cnt + 1; else begin rx_clk_cnt <= 0; rx_state <= 2; rx_bit_idx <= 0; end
+            2: if(rx_clk_cnt < BIT_PERIOD) rx_clk_cnt <= rx_clk_cnt + 1; else begin rx_clk_cnt <= 0; rx_data[rx_bit_idx] <= rx; if(rx_bit_idx < 7) rx_bit_idx <= rx_bit_idx + 1; else begin rx_state <= 0; rx_ready <= 1; end end
+        endcase
+    end
+endmodule
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# zedboard_top
+module zedboard_top(
+    input clk, rst_sw, start_sw,
+    input btn_center,       
+    input uart_rx,
+    output uart_tx,
+    output [7:0] leds
+);
+    wire [7:0] rx_byte, fsm_out;
+    wire rx_ready, tx_busy, fsm_err, fsm_done;
+    wire [2:0] fsm_state;
+    reg [7:0] accumulator, tx_data;
+    reg tx_start, input_ready, seq_done;
+
+    reg [25:0] hb; always @(posedge clk) hb <= hb + 1;
+    assign leds[7] = hb[25]; // LD7 Heartbeat
+
+    uart_bus #(.BAUD_RATE(9600)) uart_inst (
+        .clk(clk), .rx(uart_rx), .tx(uart_tx),
+        .rx_data(rx_byte), .rx_ready(rx_ready),
+        .tx_data(tx_data), .tx_start(tx_start), .tx_busy(tx_busy)
+    );
+
+    fibonacci_core fsm_inst (
+        .clk(clk), .reset(rst_sw), .start(start_sw),
+        .input_valid(input_ready), .seq_done_in(seq_done),
+        .data_in(accumulator), .fib_out(fsm_out),
+        .error(fsm_err), .done(fsm_done), .state_debug(fsm_state)
+    );
+
+    // UNIFIED LOGIC BLOCK
+    always @(posedge clk) begin
+        input_ready <= 0; seq_done <= 0; tx_start <= 0;
+
+        if (rst_sw) begin
+            accumulator <= 0; tx_data <= 0;
+        end else begin
+            // 1. Keyboard Input
+            if (rx_ready) begin
+                if (rx_byte >= "0" && rx_byte <= "9") begin
+                    accumulator <= (accumulator * 10) + (rx_byte - "0");
+                    tx_data <= rx_byte; tx_start <= 1;
+                end else if (rx_byte == "#" || rx_byte == 8'h0D) begin
+                    input_ready <= 1;
+                end else if (rx_byte == "*") begin
+                    input_ready <= 1; seq_done <= 1;
+                end
+            end 
+
+            // 2. Physical Button Input (Backup)
+            if (btn_center) input_ready <= 1;
+
+            // 3. Result Output
+            else if ((fsm_done || fsm_err) && !tx_busy && !tx_start) begin
+                tx_data <= fsm_err ? "E" : (8'h30 + (fsm_out % 10)); 
+                tx_start <= 1;
+            end
+
+            if (input_ready) accumulator <= 0;
+        end
+    end
+
+    assign leds[2:0] = fsm_state;
+    assign leds[3] = fsm_err;
+    assign leds[4] = fsm_done;
+    assign leds[6:5] = 0;
+endmodule
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# constraint 
+set_property PACKAGE_PIN Y9 [get_ports clk]
+set_property IOSTANDARD LVCMOS33 [get_ports clk]
+
+set_property PACKAGE_PIN F22 [get_ports rst_sw]
+set_property IOSTANDARD LVCMOS25 [get_ports rst_sw]
+set_property PACKAGE_PIN G22 [get_ports start_sw]
+set_property IOSTANDARD LVCMOS25 [get_ports start_sw]
+
+# Center Button BTNC
+set_property PACKAGE_PIN P16 [get_ports btn_center]
+set_property IOSTANDARD LVCMOS25 [get_ports btn_center]
+
+set_property PACKAGE_PIN V18 [get_ports uart_tx]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_tx]
+set_property PACKAGE_PIN R15 [get_ports uart_rx]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_rx]
+
+set_property PACKAGE_PIN T22 [get_ports {leds[0]}]
+set_property PACKAGE_PIN T21 [get_ports {leds[1]}]
+set_property PACKAGE_PIN U22 [get_ports {leds[2]}]
+set_property PACKAGE_PIN U21 [get_ports {leds[3]}]
+set_property PACKAGE_PIN V22 [get_ports {leds[4]}]
+set_property PACKAGE_PIN W22 [get_ports {leds[5]}]
+set_property PACKAGE_PIN U19 [get_ports {leds[6]}]
+set_property PACKAGE_PIN U14 [get_ports {leds[7]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {leds[*]}]
+
